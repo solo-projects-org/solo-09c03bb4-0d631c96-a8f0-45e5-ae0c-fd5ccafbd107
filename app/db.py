@@ -52,8 +52,34 @@ CREATE TABLE IF NOT EXISTS requests (
     epsilon       TEXT NOT NULL,
     noisy_count   INTEGER NOT NULL,
     budget_after  TEXT NOT NULL,
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    withdrawals_at_snapshot INTEGER NOT NULL DEFAULT 0
 );
+
+-- Withdrawn subjects.  Rows are never deleted: the original CSV is imported
+-- once and a withdrawal can arrive before *or* after the import, so the
+-- ledger must tolerate subject ids that are not (yet) in ``subjects``.  The
+-- table therefore has no foreign key and no UNIQUE-insert guard; the
+-- repository ignores duplicate withdrawals, which keeps every request's
+-- response identical whether or not the subject exists.
+CREATE TABLE IF NOT EXISTS withdrawals (
+    subject_id    TEXT PRIMARY KEY,
+    withdrawn_at  TEXT NOT NULL,
+    /* Serialisation witness: every withdrawal takes the next value, so a
+       writer that reads a stale withdrawn count can tell its snapshot predates
+       an already-committed withdrawal. */
+    sequence      INTEGER NOT NULL
+);
+
+-- Sync counter incremented by every withdrawal commit.  ``requests`` rows store
+-- the value of this counter immediately before their snapshot was taken, which
+-- is how a late transaction detects that a withdrawal committed after its
+-- snapshot: it cannot publish an answer computed from the older table state.
+CREATE TABLE IF NOT EXISTS withdrawal_counter (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    last_sequence  INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO withdrawal_counter (id, last_sequence) VALUES (1, 0);
 """
 
 
@@ -93,6 +119,25 @@ class Database:
     def initialise(self) -> None:
         conn = self.connect()
         conn.executescript(SCHEMA)
+        self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Additive migrations for databases created by earlier versions.
+
+        ``CREATE TABLE IF NOT EXISTS`` does not add columns to an existing
+        table, so a volume created before withdrawals existed needs the
+        snapshot-witness column added explicitly.  Only additive, idempotent
+        changes are made; no data is rewritten.
+        """
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(requests)").fetchall()
+        }
+        if "withdrawals_at_snapshot" not in columns:
+            conn.execute(
+                "ALTER TABLE requests ADD COLUMN "
+                "withdrawals_at_snapshot INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close_thread_connection(self) -> None:
         conn = getattr(self._local, "conn", None)

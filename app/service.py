@@ -11,6 +11,11 @@ Properties enforced here rather than in the HTTP layer:
   exists, so the client may retry.
 * If the commit succeeds but the HTTP response is lost, the stored answer is
   durable and a retry after a restart returns the same number.
+* Withdrawn subjects are excluded from every count.  The true count is taken
+  from a snapshot tagged with the withdrawal ledger's sequence; the write
+  transaction re-reads that sequence and refuses to publish a count that
+  predates a withdrawal which has already committed.  A refusal writes
+  nothing, so the service simply takes a fresh snapshot and draws again.
 """
 
 from __future__ import annotations
@@ -25,6 +30,13 @@ from .privacy import canonical_epsilon, make_noisy_count, request_fingerprint
 
 logger = logging.getLogger(__name__)
 
+#: Safety bound on withdraw/recompute cycles.  Each retry only happens after a
+#: different withdrawal committed, and a withdrawal is a rare administrative
+#: action; hitting this bound means the ledger is churning faster than queries
+#: can complete, in which case refusing is preferable to publishing an answer
+#: from a stale snapshot.
+MAX_SNAPSHOT_ATTEMPTS = 8
+
 
 @dataclass(frozen=True)
 class QueryOutcome:
@@ -36,6 +48,10 @@ class QueryOutcome:
     @property
     def charged(self) -> bool:
         return not self.replayed
+
+
+class SnapshotUnstable(Exception):
+    """Withdrawals kept committing; no answer could be published in order."""
 
 
 class QueryService:
@@ -53,7 +69,8 @@ class QueryService:
 
         # Fast path: an existing answer is a pure read.  It does not consult
         # the budget, so a replay still works after the budget is exhausted.
-        # The reported remaining budget is the *current* global figure.
+        # The reported remaining budget is the *current* global figure.  A
+        # replay also ignores withdrawals: published answers are immutable.
         lookup = self._repo.lookup(request_id)
         stored = lookup.stored
         if stored is not None:
@@ -66,17 +83,38 @@ class QueryService:
                 replayed=True,
             )
 
-        true_count = self._repo.count_subjects(region, outcome)
-        released = make_noisy_count(true_count, epsilon)
+        for attempt in range(1, MAX_SNAPSHOT_ATTEMPTS + 1):
+            snapshot = self._repo.withdrawal_snapshot()
+            true_count = self._repo.count_subjects(
+                region, outcome, snapshot.sequence
+            )
+            released = make_noisy_count(true_count, epsilon)
 
-        result: ReleaseResult = self._repo.apply_query(
-            request_id=request_id,
-            fingerprint=fingerprint,
-            region=region,
-            outcome=outcome,
-            epsilon=epsilon,
-            noisy_count=released,
-        )
+            result: ReleaseResult = self._repo.apply_query(
+                request_id=request_id,
+                fingerprint=fingerprint,
+                region=region,
+                outcome=outcome,
+                epsilon=epsilon,
+                noisy_count=released,
+                withdrawn_through=snapshot.sequence,
+            )
+            if not result.stale_snapshot:
+                break
+            logger.info(
+                "withdrawal committed after snapshot for %s; recomputing "
+                "(attempt %d)",
+                request_id,
+                attempt,
+            )
+        else:
+            # Exhausted the retry budget.  Nothing was written by any refused
+            # attempt, so no budget was charged and no answer exists.
+            raise SnapshotUnstable(
+                "withdrawals are being recorded too quickly to publish an "
+                "answer from a stable snapshot"
+            )
+
         if result.replayed:
             # Another request handler committed this id first.  Its answer is
             # the one that was published; ours was never released, so the
@@ -90,5 +128,9 @@ class QueryService:
             replayed=result.replayed,
         )
 
+    # -- administrative ----------------------------------------------------
+    def withdraw_subject(self, subject_id: str):
+        return self._repo.record_withdrawal(subject_id)
 
-__all__ = ["QueryService", "QueryOutcome"]
+
+__all__ = ["QueryService", "QueryOutcome", "SnapshotUnstable"]

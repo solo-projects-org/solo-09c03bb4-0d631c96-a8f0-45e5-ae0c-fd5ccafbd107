@@ -26,6 +26,9 @@ ENV DATABASE_PATH=/srv/data/followup.db \
     CSV_PATH=/srv/seed/followup.csv \
     TOTAL_BUDGET=1 \
     IMPORT_ON_STARTUP=1
+# ADMIN_TOKEN is intentionally not set in the image: it is injected by the
+# operator (Compose reads it from the host environment).  With no token the
+# administrator endpoints stay disabled.
 
 EXPOSE 8000
 
